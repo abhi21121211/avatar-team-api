@@ -368,15 +368,26 @@ async def add_task(project_name: str, task: Dict[str, Any] = Body(...)):
 async def update_task(request: TaskUpdateRequest):
     """Update a task's status."""
     try:
+        # Map frontend status values to backend status values
+        status_mapping = {
+            "todo": "pending",
+            "in_progress": "in_progress",
+            "done": "completed"
+        }
+        
+        # Use the mapped status or the original if not found in mapping
+        backend_status = status_mapping.get(request.status, request.status)
+        
         task = project_manager.update_task_status(
             request.project_name,
             request.task_id,
-            request.status
+            backend_status
         )
         return {"status": "success", "task": task}
-    except ValueError:
+    except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Task {request.task_id} not found in project {request.project_name}")
     except Exception as e:
+        print(f"Error updating task: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/tasks/{project_name}")
