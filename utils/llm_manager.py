@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 
 from utils.config import (
     ModelProvider,
@@ -71,7 +71,7 @@ class LLMManager:
         
         return self.current_models.get(provider, "")
     
-    def generate_response(self, prompt: str, provider: Optional[ModelProvider] = None, model: Optional[str] = None) -> str:
+    def generate_response(self, prompt: str, provider: Optional[ModelProvider] = None, model: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> str:
         """Generate a response using the current or specified provider and model"""
         if provider is None:
             provider = self.current_provider
@@ -80,7 +80,23 @@ class LLMManager:
             model = self.current_models.get(provider, "")
         
         try:
-            return get_gemini_response(prompt, model=model, provider=provider)
+            # Add context to the prompt if provided
+            enhanced_prompt = prompt
+            if context:
+                # Format context for the prompt
+                context_str = ""
+                if context.get("current_project"):
+                    context_str += f"Current Project: {context['current_project']}\n"
+                if context.get("role"):
+                    context_str += f"Your Role: {context['role']}\n"
+                if context.get("goal"):
+                    context_str += f"Your Goal: {context['goal']}\n"
+                
+                # Only prepend context if it's not already included in the prompt
+                if context_str and context_str not in prompt:
+                    enhanced_prompt = f"{context_str}\n{prompt}"
+            
+            return get_gemini_response(enhanced_prompt, model=model, provider=provider)
         except Exception as e:
             return f"Error generating response with {provider}/{model}: {str(e)}"
     

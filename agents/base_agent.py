@@ -76,7 +76,8 @@ class BaseAgent(ABC, BaseModel):
         """Add a conversation entry to the agent's history."""
         self.conversations.append({
             "role": role,
-            "content": content
+            "content": content,
+            "project": self.project_manager.current_project if self.project_manager else ""
         })
     
     def get_conversations(self) -> List[Dict[str, Any]]:
@@ -152,7 +153,7 @@ class BaseAgent(ABC, BaseModel):
 
     def get_my_tasks(self) -> list:
         """Get tasks assigned to this agent"""
-        if not self.project_manager:
+        if not self.project_manager: 
             return []
         return [
             task for task in self.project_manager.get_tasks(self.project_manager.current_project)

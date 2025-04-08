@@ -63,6 +63,7 @@ for agent in agents.values():
 class ChatRequest(BaseModel):
     message: str
     agent: str
+    project: Optional[str] = None
 
 class TaskRequest(BaseModel):
     task: str
@@ -440,15 +441,55 @@ async def chat_with_agent(request: ChatRequest):
         # Use the LLM manager to generate the response
         agent_obj = agents[request.agent]
         
+        # Set the current project for the agent if provided
+        if request.project:
+            project_manager.current_project = request.project
+            
+            # Get project details and agent-specific tasks
+            project_context = {}
+            try:
+                project_context = project_manager.get_project(request.project)
+                agent_tasks = [task for task in project_context.get("tasks", []) 
+                               if task.get("assigned_to") == request.agent]
+            except Exception as e:
+                print(f"Error getting project context: {str(e)}")
+        
         # Modify the agent to use the current LLM provider and model
         provider = llm_manager.get_current_provider()
         model = llm_manager.get_current_model(provider)
         
-        # Generate response using the selected provider/model
+        # Prepare context for the agent
+        context = {
+            "role": agent_obj.role,
+            "goal": agent_obj.goal,
+            "backstory": agent_obj.backstory
+        }
+        
+        if request.project:
+            context["current_project"] = request.project
+            context["project_details"] = project_context
+            context["my_tasks"] = agent_tasks
+        
+        # Create a prompt that includes project context if available
+        prompt = request.message
+        if request.project:
+            prompt = f"""
+You are working on the project "{request.project}".
+Project description: {project_context.get('description', 'No description available')}
+
+Your assigned tasks:
+{format_tasks(agent_tasks)}
+
+As {formatAgentName(request.agent)}, with your expertise and role, please respond to:
+{request.message}
+"""
+        
+        # Generate response using the selected provider/model with context
         response = llm_manager.generate_response(
-            request.message,
+            prompt,
             provider=provider,
-            model=model
+            model=model,
+            context=context
         )
         
         # Store the conversation in the agent
@@ -467,6 +508,25 @@ async def chat_with_agent(request: ChatRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Helper functions
+def formatAgentName(agent: str) -> str:
+    """Format agent name for display"""
+    import re
+    parts = re.findall(r'[A-Z][a-z]*', agent)
+    return " ".join(parts).title() if parts else agent.title()
+
+def format_tasks(tasks: List[Dict[str, Any]]) -> str:
+    """Format tasks for display in the prompt"""
+    if not tasks:
+        return "You have no assigned tasks for this project yet."
+    
+    formatted = []
+    for task in tasks:
+        status = task.get("status", "pending").upper()
+        formatted.append(f"- {task.get('name', 'Unnamed task')} ({status})\n  {task.get('description', 'No description')}")
+    
+    return "\n".join(formatted)
 
 @app.get("/api/conversations/{agent}")
 async def get_conversations(agent: str):
