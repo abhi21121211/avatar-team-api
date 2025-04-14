@@ -529,7 +529,7 @@ def format_tasks(tasks: List[Dict[str, Any]]) -> str:
     return "\n".join(formatted)
 
 @app.get("/api/conversations/{agent}")
-async def get_conversations(agent: str):
+async def get_conversations(agent: str, project: str | None = None):
     try:
         agent_instance = agents.get(agent)
         if not agent_instance:
@@ -537,6 +537,9 @@ async def get_conversations(agent: str):
         
         try:
             conversations = agent_instance.get_conversations()
+            # Filter conversations by project if provided
+            if project:
+                conversations = [conv for conv in conversations if conv.get("project") == project]
             return {"conversations": conversations}
         except AttributeError:
             print(f"Warning: Agent {agent} doesn't have get_conversations method")
