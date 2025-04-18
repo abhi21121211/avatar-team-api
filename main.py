@@ -20,8 +20,10 @@ from agents.technical_writer import TechnicalWriter
 from agents.customer_success import CustomerSuccess
 from agents.legal_compliance import LegalCompliance
 from agents.marketing_sales import MarketingSales
-from utils.project_manager import ProjectManager
+from utils.project_manager_mongo import MongoProjectManager
 from utils.llm_manager import llm_manager, ModelProvider
+from utils.database import connect_to_mongodb, close_mongodb_connection, create_project as db_create_project, list_projects as db_list_projects, get_project as db_get_project, get_project_tasks, plan_project as db_plan_project, update_task_status
+from utils.helpers import serialize_model
 
 # Ensure Python recognizes the current directory
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -37,8 +39,18 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-# Initialize project manager
-project_manager = ProjectManager("projects")
+# Startup event to connect to MongoDB
+@app.on_event("startup")
+async def startup_db_client():
+    app.mongodb = await connect_to_mongodb()
+
+# Shutdown event to close MongoDB connection
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    await close_mongodb_connection()
+
+# Initialize project manager with MongoDB support
+project_manager = MongoProjectManager("projects")
 
 # Initialize agents
 agents = {
@@ -120,40 +132,78 @@ tasks = {
 async def create_project(request: ProjectRequest):
     """Create a new project."""
     try:
-        project = project_manager.create_project(request.name, request.description)
-        return {"status": "success", "project": project}
+        # Use the async version directly
+        project = await db_create_project(request.name, request.description)
+        
+        # Also create directory structure for compatibility
+        project_dir = os.path.join(project_manager.base_directory, request.name)
+        if not os.path.exists(project_dir):
+            os.makedirs(project_dir)
+            os.makedirs(os.path.join(project_dir, "src"), exist_ok=True)
+            os.makedirs(os.path.join(project_dir, "docs"), exist_ok=True)
+        
+        # Set as current project
+        project_manager.current_project = request.name
+        
+        # Convert project to dict using helper
+        project_data = serialize_model(project)
+        
+        return {"status": "success", "project": project_data}
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error creating project: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/projects")
 async def list_projects():
     """List all projects."""
     try:
-        projects = project_manager.list_projects()
-        return {"status": "success", "projects": projects}
+        # Use async db function directly
+        projects = await db_list_projects()
+        
+        # Convert each project to dict using helper
+        project_list = [serialize_model(project) for project in projects]
+        
+        return {"status": "success", "projects": project_list}
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error listing projects: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/projects/{project_name}")
-async def get_project(project_name: str):
+async def  get_project(project_name: str):
     """Get project details."""
     try:
-        project = project_manager.get_project(project_name)
-        return {"status": "success", "project": project}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Project {project_name} not found")
+        # Use async db function directly
+        project = await db_get_project(project_name)
+        
+        if not project:
+            raise HTTPException(status_code=404, detail=f"Project {project_name} not found")
+        
+        # Convert project to dict using helper
+        project_data = serialize_model(project)
+            
+        return {"status": "success", "project": project_data}
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error getting project {project_name}: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/projects/{project_name}/plan")
 async def plan_project(project_name: str):
-    """Create a project plan with tasks."""
+    """Create a project plan with tasks for team members."""
     try:
-        project = project_manager.plan_project(project_name)
-        return {"status": "success", "project": project}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Project {project_name} not found")
+        result = await db_plan_project(project_name)
+        return {"status": "success", "plan": result}
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error creating plan for project {project_name}: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/projects/import")
@@ -369,37 +419,28 @@ async def add_task(project_name: str, task: Dict[str, Any] = Body(...)):
 async def update_task(request: TaskUpdateRequest):
     """Update a task's status."""
     try:
-        # Map frontend status values to backend status values
-        status_mapping = {
-            "todo": "pending",
-            "in_progress": "in_progress",
-            "done": "completed"
-        }
-        
-        # Use the mapped status or the original if not found in mapping
-        backend_status = status_mapping.get(request.status, request.status)
-        
-        task = project_manager.update_task_status(
-            request.project_name,
-            request.task_id,
-            backend_status
-        )
-        return {"status": "success", "task": task}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=f"Task {request.task_id} not found in project {request.project_name}")
+        updated_task = await update_task_status(request.project_name, request.task_id, request.status)
+        return {"status": "success", "task": updated_task}
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
-        print(f"Error updating task: {str(e)}")
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error updating task status: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/tasks/{project_name}")
 async def get_tasks(project_name: str):
     """Get all tasks in a project."""
     try:
-        tasks = project_manager.get_tasks(project_name)
+        tasks = await get_project_tasks(project_name)
+        if tasks is None:
+            raise HTTPException(status_code=404, detail=f"Project {project_name} not found")
         return {"status": "success", "tasks": tasks}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Project {project_name} not found")
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error getting tasks for project {project_name}: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Original API Endpoints
@@ -431,9 +472,11 @@ async def execute_task(request: TaskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/api/chat")
 async def chat_with_agent(request: ChatRequest):
     """Chat with a specific agent."""
+    print(f"Chat request received: {request}")
     try:
         if request.agent not in agents:
             raise HTTPException(status_code=404, detail=f"Agent {request.agent} not found")
@@ -442,13 +485,16 @@ async def chat_with_agent(request: ChatRequest):
         agent_obj = agents[request.agent]
         
         # Set the current project for the agent if provided
+        project_context = {}
+        agent_tasks = []
+        
         if request.project:
             project_manager.current_project = request.project
             
             # Get project details and agent-specific tasks
-            project_context = {}
             try:
-                project_context = project_manager.get_project(request.project)
+                project_context = await project_manager.get_project(request.project)
+                # Fix: Don't use await with list comprehension
                 agent_tasks = [task for task in project_context.get("tasks", []) 
                                if task.get("assigned_to") == request.agent]
             except Exception as e:
@@ -507,6 +553,9 @@ As {formatAgentName(request.agent)}, with your expertise and role, please respon
             }
         }
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in chat_with_agent: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Helper functions

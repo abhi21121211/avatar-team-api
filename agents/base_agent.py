@@ -1,5 +1,5 @@
 import asyncio
-from memory.shared_memory import shared_memory
+from memory.mongo_memory import mongo_shared_memory
 from abc import ABC, abstractmethod
 from pydantic import BaseModel, Field
 from typing import Dict, Optional, List, Any
@@ -14,7 +14,7 @@ class BaseAgent(ABC, BaseModel):
     goal: str = Field(..., description="The goal of the agent")
     backstory: str = Field(..., description="The backstory of the agent")
     project_manager: Optional[ProjectManager] = Field(None, description="Project manager instance")
-    memory: Any = Field(default=shared_memory, description="Shared memory instance")
+    memory: Any = Field(default=mongo_shared_memory, description="Shared memory instance")
     conversations: List[Dict[str, Any]] = Field(default_factory=list, description="List of conversations")
     gemini_config: Dict[str, Any] = Field(default_factory=dict, description="Gemini API configuration")
     
