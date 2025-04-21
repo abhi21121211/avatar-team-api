@@ -71,6 +71,9 @@ agents = {
 for agent in agents.values():
     agent.project_manager = project_manager
 
+# Register all agents with the ProductManager (team lead)
+agents["productManager"].register_agents(agents)
+
 # Define request models
 class ChatRequest(BaseModel):
     message: str
@@ -104,6 +107,18 @@ class TaskUpdateRequest(BaseModel):
     task_id: str
     status: str
 
+# Add new request models for project and agent coordination
+class ProjectRequestBreakdown(BaseModel):
+    request: str
+    
+class A2ACommunicationRequest(BaseModel):
+    target_agent: str
+    message: str
+    
+class MCPTaskRequest(BaseModel):
+    task: str
+    agents: List[str]
+
 # Add new request models for LLM settings
 class LLMProviderRequest(BaseModel):
     provider: str
@@ -111,6 +126,23 @@ class LLMProviderRequest(BaseModel):
 class LLMModelRequest(BaseModel):
     provider: str
     model: str
+
+class TaskAssignmentRequest(BaseModel):
+    agent: str
+    task: str
+
+# Add new request models for project planning
+class ProjectPlanRequest(BaseModel):
+    project_name: str
+    project_description: str
+
+class DiscussPlanRequest(BaseModel):
+    project_name: str
+    plan_summary: str
+
+class FinalizePlanRequest(BaseModel):
+    project_name: str
+    client_approval: bool = False
 
 # Define tasks for each agent
 tasks = {
@@ -434,13 +466,64 @@ async def get_tasks(project_name: str):
     """Get all tasks in a project."""
     try:
         tasks = await get_project_tasks(project_name)
-        if tasks is None:
-            raise HTTPException(status_code=404, detail=f"Project {project_name} not found")
         return {"status": "success", "tasks": tasks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# New API endpoints for ProductManager team lead functionality
+
+@app.post("/api/project/breakdown")
+async def breakdown_project_request(request: ProjectRequestBreakdown):
+    """Break down any project request into subtasks for team members."""
+    try:
+        product_manager = agents["productManager"]
+        breakdown = product_manager.breakdown_project_request(request.request)
+        return {"status": "success", "breakdown": breakdown}
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Error getting tasks for project {project_name}: {str(e)}\n{error_details}")
+        print(f"Error breaking down project request: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/project/status")
+async def get_project_status():
+    """Get status report for the current project."""
+    try:
+        product_manager = agents["productManager"]
+        status = product_manager.update_project_status()
+        return {"status": "success", "project_status": status}
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error getting project status: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/a2a/communicate")
+async def agent_to_agent_communication(request: A2ACommunicationRequest):
+    """Use A2A protocol for direct agent communication."""
+    try:
+        product_manager = agents["productManager"]
+        # This is async, we need to await it
+        response = await product_manager.communicate_with_agent(request.target_agent, request.message)
+        return {"status": "success", "response": response}
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in A2A communication: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/mcp/coordinate")
+async def coordinate_multi_agent_task(request: MCPTaskRequest):
+    """Use MCP server to coordinate a task across multiple agents."""
+    try:
+        product_manager = agents["productManager"]
+        # This is async, we need to await it
+        results = await product_manager.coordinate_multi_agent_task(request.task, request.agents)
+        return {"status": "success", "results": results}
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in MCP coordination: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Original API Endpoints
@@ -677,6 +760,46 @@ async def set_llm_model(request: LLMModelRequest):
             "model": request.model
         }
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add API endpoints for project planning
+@app.post("/api/project/plan/create")
+async def create_project_plan(request: ProjectPlanRequest):
+    """Create a comprehensive project plan for a new or existing project."""
+    try:
+        product_manager = agents["productManager"]
+        plan = await product_manager.create_project_plan(request.project_name, request.project_description)
+        return {"status": "success", "plan": plan}
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error creating project plan: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/project/plan/discuss")
+async def discuss_plan_with_team(request: DiscussPlanRequest):
+    """Discuss the project plan with all team members to get their input."""
+    try:
+        product_manager = agents["productManager"]
+        responses = await product_manager.discuss_plan_with_team(request.project_name, request.plan_summary)
+        return {"status": "success", "responses": responses}
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error discussing plan with team: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/project/plan/finalize")
+async def finalize_project_plan(request: FinalizePlanRequest):
+    """Finalize the project plan after team discussion and client approval."""
+    try:
+        product_manager = agents["productManager"]
+        finalized_plan = await product_manager.finalize_project_plan(request.project_name, request.client_approval)
+        return {"status": "success", "plan": finalized_plan}
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error finalizing project plan: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

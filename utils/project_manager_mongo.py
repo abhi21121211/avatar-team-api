@@ -12,7 +12,8 @@ from utils.database import (
     add_task as db_add_task,
     update_task_status as db_update_task_status,
     create_or_update_file as db_create_or_update_file,
-    get_file as db_get_file
+    get_file as db_get_file,
+    plan_project as db_plan_project
 )
 
 class MongoProjectManager:
@@ -237,6 +238,24 @@ class MongoProjectManager:
         """Synchronous wrapper for get_tasks."""
         return self._run_async_in_sync_context(self.get_tasks(project_name))
     
+    def plan_project_sync(self, project_name: str) -> Dict[str, Any]:
+        """Synchronous wrapper for plan_project."""
+        try:
+            # Create a new event loop to avoid conflicts
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                result = new_loop.run_until_complete(db_plan_project(project_name))
+                return result
+            finally:
+                new_loop.close()
+                asyncio.set_event_loop(None)
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error in plan_project_sync: {str(e)}\n{error_details}")
+            raise
+    
     # For compatibility with the original implementation
     def create_project(self, name: str, description: str) -> Dict[str, Any]:
         return self.create_project_sync(name, description)
@@ -281,4 +300,11 @@ class MongoProjectManager:
         return self.update_task_status_sync(project_name, task_id, status)
     
     def get_tasks(self, project_name: str) -> List[Dict[str, Any]]:
-        return self.get_tasks_sync(project_name) 
+        return self.get_tasks_sync(project_name)
+    
+    def plan_project(self, project_name: str) -> Dict[str, Any]:
+        """Create a project plan with tasks for team members."""
+        return self.plan_project_sync(project_name)
+    
+    def import_existing_project(self, source_dir: str, project_name: str, description: str) -> Dict[str, Any]:
+        """Import an existing project from a directory.""" 

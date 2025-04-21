@@ -5,6 +5,7 @@ import os
 import uuid
 from typing import Dict, Any, List
 import google.generativeai as genai
+import requests
 
 class ChiefArchitect(BaseAgent):
     """Chief Architect agent responsible for high-level system design and architecture."""
@@ -60,17 +61,160 @@ class ChiefArchitect(BaseAgent):
             project_info = get_gemini_response(prompt)
             project_info = eval(project_info)  # Convert string to dict
             
-            # Create project
-            project = self.project_manager.create_project(
-                project_info["name"],
-                project_info["description"]
-            )
+            # Import needed modules
+            import concurrent.futures
+            import asyncio
+            import motor.motor_asyncio
+            import os
+            from dotenv import load_dotenv
+            from datetime import datetime
             
-            return f"""Project '{project_info['name']}' has been created successfully!
+            project_name = project_info["name"]
+            project_description = project_info["description"]
+            
+            # Define the project creation function with proper error handling
+            def run_async_func():
+                # Set up a thread-local event loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Load environment variables
+                load_dotenv()
+                
+                # MongoDB Configuration with error handling
+                MONGODB_URI = os.getenv("MONGODB_URI")
+                if not MONGODB_URI:
+                    return {"error": "MONGODB_URI environment variable is not set"}
+                
+                # Create a new client with proper connection timeout and retry options
+                client = motor.motor_asyncio.AsyncIOMotorClient(
+                    MONGODB_URI,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=5000
+                )
+                
+                # Function to run with the new client
+                async def run_with_new_client():
+                    try:
+                        # Check if we can connect to the database
+                        try:
+                            # Ping the MongoDB server to check connection
+                            await client.admin.command('ping')
+                        except Exception as e:
+                            return {"error": f"Failed to connect to MongoDB: {str(e)}"}
+                        
+                        db = client.avatar_team_db
+                        
+                        # Check if project already exists
+                        try:
+                            existing = await db.projects.find_one({"name": project_name})
+                            if existing:
+                                return {"error": f"Project {project_name} already exists"}
+                        except Exception as e:
+                            return {"error": f"Failed to check if project exists: {str(e)}"}
+                        
+                        # Create project in MongoDB
+                        project_data = {
+                            "name": project_name,
+                            "description": project_description,
+                            "created_at": datetime.now(),
+                            "updated_at": datetime.now(),
+                            "tasks": []
+                        }
+                        
+                        try:
+                            await db.projects.insert_one(project_data)
+                        except Exception as e:
+                            return {"error": f"Failed to create project in database: {str(e)}"}
+                        
+                        # Create project directory if needed
+                        if self.project_manager:
+                            try:
+                                base_directory = self.project_manager.base_directory
+                                project_dir = os.path.join(base_directory, project_name)
+                                
+                                if not os.path.exists(project_dir):
+                                    os.makedirs(project_dir)
+                                    
+                                # Create source code directory
+                                src_dir = os.path.join(project_dir, "src")
+                                if not os.path.exists(src_dir):
+                                    os.makedirs(src_dir)
+                                
+                                # Create documentation directory
+                                docs_dir = os.path.join(project_dir, "docs")
+                                if not os.path.exists(docs_dir):
+                                    os.makedirs(docs_dir)
+                                    
+                                # Create README.md
+                                readme_content = f"# {project_name}\n\n{project_description}\n\n## Getting Started\n\nThis project is managed by the AI Avatar Team."
+                                readme_path = os.path.join(project_dir, "README.md")
+                                with open(readme_path, "w") as f:
+                                    f.write(readme_content)
+                            except Exception as e:
+                                return {"error": f"Failed to create project directories: {str(e)}"}
+                            
+                            # Store README in MongoDB
+                            try:
+                                await db.files.insert_one({
+                                    "project_name": project_name,
+                                    "file_path": "README.md",
+                                    "content": readme_content,
+                                    "created_at": datetime.now(),
+                                    "updated_at": datetime.now()
+                                })
+                            except Exception as e:
+                                # Non-critical error - project was created but README wasn't stored in DB
+                                print(f"Warning: Failed to store README in database: {str(e)}")
+                        
+                        return {
+                            "status": "success",
+                            "project": {
+                                "name": project_name,
+                                "description": project_description
+                            }
+                        }
+                    
+                    except Exception as e:
+                        return {"error": f"Unexpected error: {str(e)}"}
+                    finally:
+                        # Always close the client
+                        client.close()
+                
+                try:
+                    return loop.run_until_complete(run_with_new_client())
+                except Exception as e:
+                    return {"error": f"Event loop error: {str(e)}"}
+                finally:
+                    try:
+                        loop.close()
+                    except:
+                        pass
+            
+            # Execute in a separate thread with proper timeout
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                try:
+                    result = executor.submit(run_async_func).result(timeout=30)
+                except concurrent.futures.TimeoutError:
+                    return "Error creating project: Operation timed out after 30 seconds"
+                except Exception as e:
+                    return f"Error in thread execution: {str(e)}"
+            
+            # Check for errors
+            if isinstance(result, dict) and "error" in result:
+                return f"Error creating project: {result['error']}"
+                
+            # Store the current project in the project manager for reference
+            self.project_manager.current_project = project_name
+            
+            return f"""Project '{project_name}' has been created successfully!
             Project structure has been initialized with standard directories.
             Would you like me to help you plan the project architecture and assign tasks to team members?"""
             
         except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error creating project: {str(e)}\n{error_details}")
             return f"Error creating project: {str(e)}"
 
     def _handle_project_planning(self, message):
@@ -79,15 +223,191 @@ class ChiefArchitect(BaseAgent):
             return "Please create a project first before planning."
         
         try:
-            # Plan the project
-            project = self.project_manager.plan_project(self.project_manager.current_project)
+            project_name = self.project_manager.current_project
             
+            # Import needed modules
+            import concurrent.futures
+            import asyncio
+            import motor.motor_asyncio
+            import os
+            from dotenv import load_dotenv
+            from datetime import datetime
+            import uuid
+            
+            # Define the task creation function with proper error handling
+            def run_async_func():
+                # Set up a thread-local event loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Load environment variables
+                load_dotenv()
+                
+                # MongoDB Configuration with error handling
+                MONGODB_URI = os.getenv("MONGODB_URI")
+                if not MONGODB_URI:
+                    return {"error": "MONGODB_URI environment variable is not set"}
+                
+                # Create a new client with proper connection timeout and retry options
+                client = motor.motor_asyncio.AsyncIOMotorClient(
+                    MONGODB_URI,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=5000
+                )
+                
+                # Function to run with the new client
+                async def run_with_new_client():
+                    try:
+                        # Check if we can connect to the database
+                        try:
+                            # Ping the MongoDB server to check connection
+                            await client.admin.command('ping')
+                        except Exception as e:
+                            return {"error": f"Failed to connect to MongoDB: {str(e)}"}
+                        
+                        db = client.avatar_team_db
+                        
+                        # Check if project exists
+                        project = await db.projects.find_one({"name": project_name})
+                        if not project:
+                            return {"error": f"Project {project_name} not found"}
+                        
+                        # Create standard tasks
+                        tasks = [
+                            {
+                                "id": str(uuid.uuid4()),
+                                "name": "Design system architecture",
+                                "description": "Create a detailed system design and architecture diagram",
+                                "assigned_to": "chiefArchitect",
+                                "status": "todo",
+                                "project_name": project_name,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            },
+                            {
+                                "id": str(uuid.uuid4()),
+                                "name": "Set up project structure",
+                                "description": "Initialize the basic project structure and files",
+                                "assigned_to": "backendEngineer",
+                                "status": "todo",
+                                "project_name": project_name,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            },
+                            {
+                                "id": str(uuid.uuid4()),
+                                "name": "Create UI mockups",
+                                "description": "Design the user interface components and layouts",
+                                "assigned_to": "uiUxDesigner",
+                                "status": "todo",
+                                "project_name": project_name,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            },
+                            {
+                                "id": str(uuid.uuid4()),
+                                "name": "Implement frontend components",
+                                "description": "Develop the React/Next.js components for the UI",
+                                "assigned_to": "frontendEngineer",
+                                "status": "todo",
+                                "project_name": project_name,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            },
+                            {
+                                "id": str(uuid.uuid4()),
+                                "name": "Implement backend APIs",
+                                "description": "Develop the API endpoints and database models",
+                                "assigned_to": "backendEngineer",
+                                "status": "todo",
+                                "project_name": project_name,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            },
+                            {
+                                "id": str(uuid.uuid4()),
+                                "name": "Set up CI/CD pipeline",
+                                "description": "Configure continuous integration and deployment",
+                                "assigned_to": "devopsEngineer",
+                                "status": "todo",
+                                "project_name": project_name,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            },
+                            {
+                                "id": str(uuid.uuid4()),
+                                "name": "Document API endpoints",
+                                "description": "Create comprehensive API documentation",
+                                "assigned_to": "technicalWriter",
+                                "status": "todo",
+                                "project_name": project_name,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            }
+                        ]
+                        
+                        # Insert tasks into MongoDB with error handling
+                        for task in tasks:
+                            try:
+                                await db.tasks.insert_one(task)
+                            except Exception as e:
+                                return {"error": f"Failed to insert task: {str(e)}"}
+                        
+                        # Update project with has_plan flag
+                        try:
+                            await db.projects.update_one(
+                                {"name": project_name},
+                                {"$set": {"has_plan": True, "updated_at": datetime.now()}}
+                            )
+                        except Exception as e:
+                            return {"error": f"Failed to update project: {str(e)}"}
+                        
+                        return {
+                            "status": "success",
+                            "project_name": project_name,
+                            "task_count": len(tasks)
+                        }
+                    
+                    except Exception as e:
+                        return {"error": f"Unexpected error: {str(e)}"}
+                    finally:
+                        # Always close the client
+                        client.close()
+                
+                try:
+                    return loop.run_until_complete(run_with_new_client())
+                except Exception as e:
+                    return {"error": f"Event loop error: {str(e)}"}
+                finally:
+                    try:
+                        loop.close()
+                    except:
+                        pass
+            
+            # Execute in a separate thread with proper timeout
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                try:
+                    result = executor.submit(run_async_func).result(timeout=30)
+                except concurrent.futures.TimeoutError:
+                    return "Error planning project: Operation timed out after 30 seconds"
+                except Exception as e:
+                    return f"Error in thread execution: {str(e)}"
+            
+            # Check for errors
+            if isinstance(result, dict) and "error" in result:
+                return f"Error planning project: {result['error']}"
+            
+            # Success!
             return f"""Project plan has been created successfully!
-            - {len(project["tasks"])} tasks have been added
+            - Added {result.get('task_count', 7)} standard tasks to the project
             - Standard architecture has been defined
+            
             Would you like me to explain the architecture or make any modifications?"""
             
         except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error planning project: {str(e)}\n{error_details}")
             return f"Error planning project: {str(e)}"
 
     def _handle_task_assignment(self, message):
@@ -96,11 +416,108 @@ class ChiefArchitect(BaseAgent):
             return "Please create a project first before assigning tasks."
         
         try:
-            # Get current tasks
-            tasks = self.project_manager.get_tasks(self.project_manager.current_project)
+            project_name = self.project_manager.current_project
+            
+            # Import needed modules
+            import concurrent.futures
+            import asyncio
+            import motor.motor_asyncio
+            import os
+            from dotenv import load_dotenv
+            
+            # Define the task retrieval function with proper error handling
+            def run_async_func():
+                # Set up a thread-local event loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Load environment variables
+                load_dotenv()
+                
+                # MongoDB Configuration with error handling
+                MONGODB_URI = os.getenv("MONGODB_URI")
+                if not MONGODB_URI:
+                    return {"error": "MONGODB_URI environment variable is not set"}
+                
+                # Create a new client with proper connection timeout and retry options
+                client = motor.motor_asyncio.AsyncIOMotorClient(
+                    MONGODB_URI,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=5000
+                )
+                
+                # Function to run with the new client
+                async def run_with_new_client():
+                    try:
+                        # Check if we can connect to the database
+                        try:
+                            # Ping the MongoDB server to check connection
+                            await client.admin.command('ping')
+                        except Exception as e:
+                            return {"error": f"Failed to connect to MongoDB: {str(e)}"}
+                        
+                        db = client.avatar_team_db
+                        
+                        # Check if project exists
+                        project = await db.projects.find_one({"name": project_name})
+                        if not project:
+                            return {"error": f"Project {project_name} not found"}
+                        
+                        # Get all tasks for this project
+                        try:
+                            cursor = db.tasks.find({"project_name": project_name})
+                            tasks = await cursor.to_list(length=100)
+                        except Exception as e:
+                            return {"error": f"Failed to retrieve tasks: {str(e)}"}
+                        
+                        return {
+                            "status": "success",
+                            "tasks": tasks
+                        }
+                    
+                    except Exception as e:
+                        return {"error": f"Unexpected error: {str(e)}"}
+                    finally:
+                        # Always close the client
+                        client.close()
+                
+                try:
+                    return loop.run_until_complete(run_with_new_client())
+                except Exception as e:
+                    return {"error": f"Event loop error: {str(e)}"}
+                finally:
+                    try:
+                        loop.close()
+                    except:
+                        pass
+            
+            # Execute in a separate thread with proper timeout
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                try:
+                    result = executor.submit(run_async_func).result(timeout=30)
+                except concurrent.futures.TimeoutError:
+                    return "Error retrieving tasks: Operation timed out after 30 seconds"
+                except Exception as e:
+                    return f"Error in thread execution: {str(e)}"
+            
+            # Check for errors
+            if isinstance(result, dict) and "error" in result:
+                return f"Error retrieving tasks: {result['error']}"
+                
+            tasks_data = result.get("tasks", [])
             
             # Create a response about task assignments
-            task_list = "\n".join([f"- {t['name']} (assigned to {t['assigned_to']})" for t in tasks])
+            task_list_items = []
+            for t in tasks_data:
+                name = t.get('name', 'Unnamed task')
+                assigned_to = t.get('assigned_to', 'Unassigned')
+                status = t.get('status', 'unknown').upper()
+                task_list_items.append(f"- {name} (assigned to {assigned_to}, status: {status})")
+            
+            task_list = "\n".join(task_list_items)
+            
+            if not task_list:
+                return "No tasks have been assigned yet. Would you like me to create some standard tasks?"
             
             return f"""Here are the current task assignments:
             
@@ -109,6 +526,9 @@ class ChiefArchitect(BaseAgent):
             Would you like me to update any of these assignments?"""
             
         except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error retrieving tasks: {str(e)}\n{error_details}")
             return f"Error retrieving tasks: {str(e)}"
 
     def create_project(self, project_name: str, description: str) -> Dict[str, Any]:

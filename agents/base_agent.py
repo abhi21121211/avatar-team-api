@@ -48,25 +48,41 @@ class BaseAgent(ABC, BaseModel):
     async def execute(self, task: str):
         """Execute a task."""
         try:
-            response = self._generate_response(f"Please execute this task: {task}")
+            # Get context for this agent including shared knowledge
+            context = await self.memory.get_agent_context(self.role)
+            
+            response = self._generate_response(f"Please execute this task: {task}", context)
             self.add_conversation("system", f"Task: {task}")
             self.add_conversation("agent", response)
             return response
-        except Exception:
-            return False
+        except Exception as e:
+            print(f"Error executing task: {str(e)}")
+            return f"Error: {str(e)}"
     
     async def chat(self, message: str):
         """Process a chat message and return a response"""
-        # Get context for this agent including shared knowledge
-        context = self.memory.get_agent_context(self.role)
-        
-        # Generate a response based on the message and context
-        response = self._generate_response(message, context)
-        
-        # Store the conversation in memory
-        self.memory.add_message(self.role, message, response)
-        
-        return response
+        try:
+            # Get context for this agent including shared knowledge
+            context = await self.memory.get_agent_context(self.role)
+            
+            # Generate a response based on the message and context
+            response = self._generate_response(message, context)
+            
+            # Store the conversation in memory
+            await self.memory.add_message(self.role, message, response)
+            
+            return response
+        except Exception as e:
+            print(f"Error in chat: {str(e)}")
+            # If there's an error getting context, try to generate a response without it
+            try:
+                response = self._generate_response(message, {})
+                self.add_conversation("user", message)
+                self.add_conversation("agent", response)
+                return response
+            except Exception as inner_e:
+                print(f"Failed to generate response: {str(inner_e)}")
+                return f"I'm having trouble processing your request due to a system error: {str(e)}"
     
     def set_project_manager(self, project_manager: ProjectManager):
         """Set the project manager for this agent"""
