@@ -2,11 +2,12 @@ import os
 import motor.motor_asyncio
 from beanie import init_beanie
 from pydantic import BaseModel
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from datetime import datetime
 import logging
 from dotenv import load_dotenv
 import uuid
+from bson import ObjectId
 
 # Load environment variables
 load_dotenv()
@@ -110,6 +111,10 @@ async def connect_to_mongodb():
         if "context" not in collections:
             logger.info("Creating context collection")
             await db.create_collection("context")
+
+        if "team_names" not in collections:
+            logger.info("Creating team_names collection")
+            await db.create_collection("team_names")
         
         logger.info("MongoDB collections initialized")
         
@@ -493,4 +498,86 @@ async def plan_project(project_name: str) -> Dict[str, Any]:
         logger.error(f"Error creating plan for project {project_name}: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        raise 
+        raise
+
+# Define team member name model
+async def create_team_member_name(role: str, name: str):
+    """Create or update a team member name mapping"""
+    try:
+        global client, db
+        if not client:
+            await connect_to_mongodb()
+        
+        # Check if the role already exists
+        existing = await db.team_names.find_one({"role": role})
+        
+        if existing:
+            # Update existing name
+            await db.team_names.update_one(
+                {"role": role},
+                {"$set": {"name": name, "updated_at": datetime.now()}}
+            )
+        else:
+            # Create new name
+            await db.team_names.insert_one({
+                "role": role,
+                "name": name,
+                "created_at": datetime.now(),
+                "updated_at": datetime.now()
+            })
+        
+        return {"role": role, "name": name}
+    except Exception as e:
+        print(f"Error in create_team_member_name: {str(e)}")
+        raise e
+
+async def get_team_member_name(role: str) -> Optional[Dict[str, Any]]:
+    """Get a team member's custom name by role"""
+    try:
+        global client, db
+        if not client:
+            await connect_to_mongodb()
+        
+        result = await db.team_names.find_one({"role": role})
+        if not result:
+            return None
+            
+        return {
+            "role": result["role"],
+            "name": result["name"]
+        }
+    except Exception as e:
+        print(f"Error in get_team_member_name: {str(e)}")
+        return None
+
+async def get_all_team_member_names() -> List[Dict[str, Any]]:
+    """Get all team member custom names"""
+    try:
+        global client, db
+        if not client:
+            await connect_to_mongodb()
+        
+        cursor = db.team_names.find({})
+        names = []
+        async for doc in cursor:
+            names.append({
+                "role": doc["role"],
+                "name": doc["name"]
+            })
+        return names
+    except Exception as e:
+        print(f"Error in get_all_team_member_names: {str(e)}")
+        return []
+
+async def delete_team_member_name(role: str) -> bool:
+    """Delete a team member custom name"""
+    try:
+        global client, db
+        if not client:
+            await connect_to_mongodb()
+        
+        result = await db.team_names.delete_one({"role": role})
+        return result.deleted_count > 0
+    except Exception as e:
+        print(f"Error in delete_team_member_name: {str(e)}")
+        return False 

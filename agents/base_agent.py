@@ -7,6 +7,14 @@ from utils.project_manager import ProjectManager
 import google.generativeai as genai
 from utils.config import get_gemini_config, get_gemini_response
 
+# Import function to get team member names
+try:
+    from utils.database import get_team_member_name
+except ImportError:
+    # Mock function for compatibility if database module doesn't have it
+    async def get_team_member_name(role):
+        return None
+
 class BaseAgent(ABC, BaseModel):
     """Base class for all agents in the system."""
     
@@ -45,13 +53,71 @@ class BaseAgent(ABC, BaseModel):
         """Generate a response based on the input message and context."""
         pass
     
+    # Add a method to prepare context with name awareness
+    def _prepare_name_aware_message(self, message: str, context: Dict[str, Any]) -> str:
+        """
+        Prepare the message with name awareness instructions when the user asks
+        about the agent's name or identity.
+        """
+        display_name = context.get("display_name", "")
+        
+        # Check if the message is asking about the agent's name or identity
+        name_queries = [
+            "what is your name", 
+            "who are you", 
+            "your name", 
+            "introduce yourself",
+            "tell me about yourself",
+            "what should i call you"
+        ]
+        
+        is_name_query = any(query in message.lower() for query in name_queries)
+        
+        if is_name_query and display_name:
+            # Add specific instructions for name-related queries
+            return f"""When responding to this message, remember that your name is "{display_name}".
+If asked about your name or identity, clearly state that your name is "{display_name}".
+
+User message: {message}"""
+        
+        return message
+        
+    async def get_display_name(self) -> str:
+        """Get the display name for this agent, using custom name if available"""
+        try:
+            custom_name = await get_team_member_name(self.role)
+            if custom_name and "name" in custom_name:
+                return custom_name["name"]
+            else:
+                # Format the role name if no custom name
+                import re
+                parts = re.findall(r'[A-Z][a-z]*', self.role)
+                return " ".join(parts).title() if parts else self.role.title()
+        except Exception as e:
+            print(f"Error getting agent display name: {str(e)}")
+            # Format the role name if error
+            import re
+            parts = re.findall(r'[A-Z][a-z]*', self.role)
+            return " ".join(parts).title() if parts else self.role.title()
+    
     async def execute(self, task: str):
         """Execute a task."""
         try:
             # Get context for this agent including shared knowledge
             context = await self.memory.get_agent_context(self.role)
             
-            response = self._generate_response(f"Please execute this task: {task}", context)
+            # Get agent's display name
+            display_name = await self.get_display_name()
+            
+            # Add display name to context
+            if context is None:
+                context = {}
+            context["display_name"] = display_name
+            
+            # Prepare name-aware message
+            name_aware_task = self._prepare_name_aware_message(f"Please execute this task: {task}", context)
+            
+            response = self._generate_response(name_aware_task, context)
             self.add_conversation("system", f"Task: {task}")
             self.add_conversation("agent", response)
             return response
@@ -65,8 +131,19 @@ class BaseAgent(ABC, BaseModel):
             # Get context for this agent including shared knowledge
             context = await self.memory.get_agent_context(self.role)
             
+            # Get agent's display name
+            display_name = await self.get_display_name()
+            
+            # Add display name to context
+            if context is None:
+                context = {}
+            context["display_name"] = display_name
+            
+            # Prepare name-aware message
+            name_aware_message = self._prepare_name_aware_message(message, context)
+            
             # Generate a response based on the message and context
-            response = self._generate_response(message, context)
+            response = self._generate_response(name_aware_message, context)
             
             # Store the conversation in memory
             await self.memory.add_message(self.role, message, response)
@@ -76,7 +153,19 @@ class BaseAgent(ABC, BaseModel):
             print(f"Error in chat: {str(e)}")
             # If there's an error getting context, try to generate a response without it
             try:
-                response = self._generate_response(message, {})
+                # Still try to get the display name
+                try:
+                    display_name = await self.get_display_name()
+                    context = {"display_name": display_name}
+                    
+                    # Prepare name-aware message even in error case
+                    name_aware_message = self._prepare_name_aware_message(message, context)
+                    
+                    response = self._generate_response(name_aware_message, context)
+                except:
+                    context = {}
+                    response = self._generate_response(message, context)
+                    
                 self.add_conversation("user", message)
                 self.add_conversation("agent", response)
                 return response

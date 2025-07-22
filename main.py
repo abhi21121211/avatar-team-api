@@ -3,6 +3,7 @@ import os
 import asyncio
 import zipfile
 import tempfile
+import re
 from fastapi import FastAPI, Body, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -22,8 +23,9 @@ from agents.legal_compliance import LegalCompliance
 from agents.marketing_sales import MarketingSales
 from utils.project_manager_mongo import MongoProjectManager
 from utils.llm_manager import llm_manager, ModelProvider
-from utils.database import connect_to_mongodb, close_mongodb_connection, create_project as db_create_project, list_projects as db_list_projects, get_project as db_get_project, get_project_tasks, plan_project as db_plan_project, update_task_status
+from utils.database import connect_to_mongodb, close_mongodb_connection, create_project as db_create_project, list_projects as db_list_projects, get_project as db_get_project, get_project_tasks, plan_project as db_plan_project, update_task_status, create_team_member_name, get_team_member_name, get_all_team_member_names, delete_team_member_name
 from utils.helpers import serialize_model
+from memory.mongo_memory import mongo_shared_memory
 
 # Ensure Python recognizes the current directory
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -144,6 +146,11 @@ class FinalizePlanRequest(BaseModel):
     project_name: str
     client_approval: bool = False
 
+# Add new request models for team member names
+class TeamMemberNameRequest(BaseModel):
+    role: str
+    name: str
+
 # Define tasks for each agent
 tasks = {
     "chiefArchitect": "Design the microservices architecture.",
@@ -158,6 +165,43 @@ tasks = {
     "legalCompliance": "Ensure project follows regulations.",
     "marketingSales": "Create marketing campaigns."
 }
+
+# Add default team member names if not existing
+async def initialize_default_team_names():
+    """Initialize default team member names if they don't exist"""
+    default_names = {
+        "chiefArchitect": "Chief Architect",
+        "frontendEngineer": "Frontend Engineer",
+        "backendEngineer": "Backend Engineer",
+        "devopsEngineer": "DevOps Engineer",
+        "aiMlEngineer": "AI/ML Engineer",
+        "productManager": "Product Manager",
+        "uiUxDesigner": "UI/UX Designer",
+        "technicalWriter": "Technical Writer",
+        "customerSuccess": "Customer Success",
+        "legalCompliance": "Legal Compliance",
+        "marketingSales": "Marketing & Sales"
+    }
+    
+    for role, name in default_names.items():
+        try:
+            existing = await get_team_member_name(role)
+            if not existing:
+                await create_team_member_name(role, name)
+        except Exception as e:
+            print(f"Error initializing name for {role}: {str(e)}")
+            # Continue with other names even if one fails
+
+# Startup event to initialize team names
+@app.on_event("startup")
+async def startup_init():
+    try:
+        app.mongodb = await connect_to_mongodb()
+        await initialize_default_team_names()
+        print("Successfully initialized team names")
+    except Exception as e:
+        print(f"Error during startup initialization: {str(e)}")
+        # Don't raise the exception to allow the application to start anyway
 
 # API Endpoints for Project Management
 @app.post("/api/projects")
@@ -503,8 +547,20 @@ async def agent_to_agent_communication(request: A2ACommunicationRequest):
     """Use A2A protocol for direct agent communication."""
     try:
         product_manager = agents["productManager"]
+        
+        # Get display names for more natural communication
+        try:
+            from_name = await get_agent_display_name("productManager")
+            to_name = await get_agent_display_name(request.target_agent)
+            
+            # Add name context to the message
+            message = f"This is {from_name} speaking to {to_name}: {request.message}"
+        except:
+            # Fall back to original message if naming fails
+            message = request.message
+        
         # This is async, we need to await it
-        response = await product_manager.communicate_with_agent(request.target_agent, request.message)
+        response = await product_manager.communicate_with_agent(request.target_agent, message)
         return {"status": "success", "response": response}
     except Exception as e:
         import traceback
@@ -555,7 +611,6 @@ async def execute_task(request: TaskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/chat")
 async def chat_with_agent(request: ChatRequest):
     """Chat with a specific agent."""
@@ -572,26 +627,46 @@ async def chat_with_agent(request: ChatRequest):
         agent_tasks = []
         
         if request.project:
-            project_manager.current_project = request.project
-            
-            # Get project details and agent-specific tasks
             try:
-                project_context = await project_manager.get_project(request.project)
-                # Fix: Don't use await with list comprehension
-                agent_tasks = [task for task in project_context.get("tasks", []) 
-                               if task.get("assigned_to") == request.agent]
+                # Set current project first
+                project_manager.current_project = request.project
+                
+                # Get project details and agent-specific tasks
+                project_data = await db_get_project(request.project)
+                
+                # Convert Project object to dictionary if needed
+                if hasattr(project_data, 'dict'):
+                    # If it's a Pydantic model with dict() method
+                    project_context = project_data.dict()
+                elif hasattr(project_data, '__dict__'):
+                    # If it's a regular object with __dict__
+                    project_context = project_data.__dict__
+                else:
+                    # Fallback to serialize it
+                    project_context = serialize_model(project_data)
+                
+                agent_tasks = await get_project_tasks(request.project)
+                agent_tasks = [task for task in agent_tasks if task.get("assigned_to") == request.agent]
             except Exception as e:
                 print(f"Error getting project context: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                # Continue with empty context
+                project_context = {}
         
         # Modify the agent to use the current LLM provider and model
         provider = llm_manager.get_current_provider()
         model = llm_manager.get_current_model(provider)
         
+        # Get agent's custom name
+        agent_name = await get_agent_display_name(request.agent)
+        
         # Prepare context for the agent
         context = {
             "role": agent_obj.role,
             "goal": agent_obj.goal,
-            "backstory": agent_obj.backstory
+            "backstory": agent_obj.backstory,
+            "display_name": agent_name
         }
         
         if request.project:
@@ -602,14 +677,23 @@ async def chat_with_agent(request: ChatRequest):
         # Create a prompt that includes project context if available
         prompt = request.message
         if request.project:
+            project_description = project_context.get('description', 'No description available')
+            if not isinstance(project_description, str):
+                project_description = str(project_description)
+                
             prompt = f"""
 You are working on the project "{request.project}".
-Project description: {project_context.get('description', 'No description available')}
+Project description: {project_description}
 
 Your assigned tasks:
 {format_tasks(agent_tasks)}
 
-As {formatAgentName(request.agent)}, with your expertise and role, please respond to:
+As {agent_name}, with your expertise and role, please respond to:
+{request.message}
+"""
+        else:
+            prompt = f"""
+As {agent_name}, with your expertise and role, please respond to:
 {request.message}
 """
         
@@ -625,10 +709,24 @@ As {formatAgentName(request.agent)}, with your expertise and role, please respon
         agent_obj.add_conversation("user", request.message)
         agent_obj.add_conversation("agent", response)
         
+        # Also store in MongoDB for shared context
+        try:
+            # Don't use mongo_shared_memory in a boolean context
+            # Just call the method directly
+            await mongo_shared_memory.add_message(
+                request.agent, 
+                request.message, 
+                response,
+                request.project
+            )
+        except Exception as e:
+            print(f"Error storing conversation in MongoDB: {str(e)}")
+        
         return {
             "status": "success", 
             "response": response,
             "agent": request.agent,
+            "agent_display_name": agent_name,
             "llm_info": {
                 "provider": provider,
                 "model": model,
@@ -643,10 +741,14 @@ As {formatAgentName(request.agent)}, with your expertise and role, please respon
 
 # Helper functions
 def formatAgentName(agent: str) -> str:
-    """Format agent name for display"""
-    import re
-    parts = re.findall(r'[A-Z][a-z]*', agent)
-    return " ".join(parts).title() if parts else agent.title()
+    """Format agent name for display, checking for custom names first"""
+    try:
+        # We can't use async function directly here, so we'll use the default name generation
+        parts = re.findall(r'[A-Z][a-z]*', agent)
+        return " ".join(parts).title() if parts else agent.title()
+    except Exception as e:
+        print(f"Error formatting agent name: {str(e)}")
+        return agent.title()
 
 def format_tasks(tasks: List[Dict[str, Any]]) -> str:
     """Format tasks for display in the prompt"""
@@ -801,6 +903,91 @@ async def finalize_project_plan(request: FinalizePlanRequest):
         error_details = traceback.format_exc()
         print(f"Error finalizing project plan: {str(e)}\n{error_details}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# API Endpoints for Team Member Names
+@app.get("/api/team-names")
+async def get_team_names():
+    """Get all team member names."""
+    try:
+        names = await get_all_team_member_names()
+        return {"status": "success", "names": names}
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error getting team names: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/team-names/{role}")
+async def get_team_name(role: str):
+    """Get a team member's name by role."""
+    try:
+        name = await get_team_member_name(role)
+        if not name:
+            raise HTTPException(status_code=404, detail=f"No name found for role: {role}")
+        return {"status": "success", "name": name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error getting team name: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/team-names")
+async def set_team_name(request: TeamMemberNameRequest):
+    """Set a team member's name."""
+    try:
+        # Validate role exists
+        if request.role not in agents:
+            raise HTTPException(status_code=404, detail=f"Agent role not found: {request.role}")
+        
+        result = await create_team_member_name(request.role, request.name)
+        return {"status": "success", "name": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error setting team name: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/team-names/{role}")
+async def remove_team_name(role: str):
+    """Remove a team member's custom name."""
+    try:
+        # Validate role exists
+        if role not in agents:
+            raise HTTPException(status_code=404, detail=f"Agent role not found: {role}")
+        
+        success = await delete_team_member_name(role)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"No custom name found for role: {role}")
+        
+        # Reset to default name
+        default_name = formatAgentName(role)
+        await create_team_member_name(role, default_name)
+        
+        return {"status": "success", "message": f"Custom name for {role} has been reset to default: {default_name}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error removing team name: {str(e)}\n{error_details}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add a helper function to get agent display name (async version)
+async def get_agent_display_name(agent: str) -> str:
+    """Get the display name for an agent, using custom name if available"""
+    try:
+        custom_name = await get_team_member_name(agent)
+        if custom_name and "name" in custom_name:
+            return custom_name["name"]
+        else:
+            return formatAgentName(agent)
+    except Exception as e:
+        print(f"Error getting agent display name: {str(e)}")
+        return formatAgentName(agent)
 
 if __name__ == "__main__":
     print("🚀 AI Avatar Team Execution Started!")

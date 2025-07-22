@@ -1,9 +1,12 @@
 import asyncio
+import threading
+import inspect
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import motor.motor_asyncio
 import os
 from dotenv import load_dotenv
+from utils.database import connect_to_mongodb
 
 # Load environment variables
 load_dotenv()
@@ -13,45 +16,64 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 if not MONGODB_URI:
     raise ValueError("MONGODB_URI environment variable is not set")
 
+# Global tracking of event loop states
+_event_loop_tls = threading.local()
+
 class MongoSharedMemory:
     """Memory storage implementation using MongoDB"""
     
     def __init__(self):
+        """Initialize the shared memory."""
         self.client = None
         self.db = None
-        self.initialized = False
+        self.connected = False
         self._init_db()
     
     def _init_db(self):
         """Initialize the MongoDB connection"""
-        if self.initialized:
+        if self.connected:
             return
         
         # Create the client
         self.client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
         self.db = self.client.avatar_team_db
-        self.initialized = True
+        self.connected = True
     
     def _get_timestamp(self):
         """Get current timestamp in ISO format"""
         return datetime.now().isoformat()
     
-    async def add_message(self, agent_name: str, user_message: str, agent_response: str):
+    async def _ensure_connected(self):
+        """Ensure connection to MongoDB."""
+        if not self.connected:
+            self.db = await connect_to_mongodb()
+            self.connected = True
+            
+    async def add_message(self, agent_name: str, user_message: str, agent_response: str, project_name: Optional[str] = None):
         """Add a message to the conversation history in MongoDB"""
-        self._init_db()
+        await self._ensure_connected()
         
-        conversation = {
-            "agent": agent_name,
-            "timestamp": datetime.now(),
-            "user_message": user_message,
-            "agent_response": agent_response
-        }
-        
-        await self.db.conversations.insert_one(conversation)
+        # Don't check self.db with a boolean condition
+        if self.db is None:
+            print("Error: Database connection not established")
+            return False
+            
+        try:
+            await self.db.conversations.insert_one({
+                "agent": agent_name,
+                "timestamp": datetime.now(),
+                "user_message": user_message,
+                "agent_response": agent_response,
+                "project_name": project_name
+            })
+            return True
+        except Exception as e:
+            print(f"Error adding message to conversation: {str(e)}")
+            return False
     
     async def get_conversation_history(self, agent_name: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get the conversation history for a specific agent from MongoDB"""
-        self._init_db()
+        await self._ensure_connected()
         
         cursor = self.db.conversations.find({"agent": agent_name}).sort("timestamp", -1).limit(limit)
         
@@ -67,7 +89,7 @@ class MongoSharedMemory:
     
     async def get_all_conversations(self, limit: int = 5) -> Dict[str, List[Dict[str, Any]]]:
         """Get recent conversations from all agents from MongoDB"""
-        self._init_db()
+        await self._ensure_connected()
         
         # Get unique agent names
         agents = set()
@@ -83,7 +105,7 @@ class MongoSharedMemory:
     
     async def add_context(self, key: str, value: Any):
         """Add or update a context entry in MongoDB"""
-        self._init_db()
+        await self._ensure_connected()
         
         # Use upsert to create or update
         await self.db.context.update_one(
@@ -94,7 +116,7 @@ class MongoSharedMemory:
     
     async def get_context(self, key: Optional[str] = None) -> Any:
         """Get context entry or all context if key is None from MongoDB"""
-        self._init_db()
+        await self._ensure_connected()
         
         if key is None:
             # Get all context
@@ -107,19 +129,13 @@ class MongoSharedMemory:
         doc = await self.db.context.find_one({"key": key})
         return doc["value"] if doc else None
     
-    async def get_agent_context(self, agent_name: str) -> Dict[str, Any]:
+    async def get_agent_context(self, agent_name: str, project_name: Optional[str] = None) -> Dict[str, Any]:
         """Get all relevant context for an agent including its conversations and shared context"""
-        try:
-            all_conversations = await self.get_all_conversations()
-        except Exception as e:
-            print(f"Error getting all conversations: {str(e)}")
-            all_conversations = {}
-            
-        try:
-            context = await self.get_context()
-        except Exception as e:
-            print(f"Error getting shared context: {str(e)}")
-            context = {}
+        await self._ensure_connected()
+        
+        if self.db is None:
+            print("Error: Database connection not established")
+            return {"error": "Database connection not established"}
         
         try:
             # Get this agent's conversations
@@ -128,39 +144,98 @@ class MongoSharedMemory:
             print(f"Error getting agent conversations: {str(e)}")
             agent_conversations = []
         
-        return {
-            "agent_conversations": agent_conversations,
-            "all_conversations": all_conversations,
-            "shared_context": context
-        }
+        try:
+            # Get recent messages from all agents for shared context
+            all_conversations = {}
+            
+            # Get recent messages from each agent
+            async for agent_doc in self.db.conversations.aggregate([
+                {"$match": {"agent": agent_name}},
+                {"$group": {
+                    "_id": "$agent",
+                    "conversations": {"$push": {
+                        "user_message": "$user_message",
+                        "agent_response": "$agent_response",
+                        "timestamp": "$timestamp"
+                    }},
+                }},
+                {"$project": {
+                    "agent": "$_id",
+                    "conversations": {"$slice": ["$conversations", 3]}  # Get only the 3 most recent
+                }}
+            ]):
+                agent = agent_doc["_id"]
+                if agent != agent_name:  # Only include other agents
+                    all_conversations[agent] = agent_doc["conversations"]
+            
+            # Get projects the agent is working on
+            projects = set()
+            async for doc in self.db.context.find({"agent": agent_name}).distinct("project_name"):
+                if doc:
+                    projects.add(doc)
+            
+            # Compile complete context
+            context = {
+                "agent": agent_name,
+                "conversations": agent_conversations,
+                "all_conversations": all_conversations,
+                "projects": list(projects)
+            }
+            
+            # Add current project context if specified
+            if project_name:
+                context["current_project"] = project_name
+                
+                # Add project tasks if available
+                try:
+                    tasks = []
+                    async for task in self.db.tasks.find({"project_name": project_name, "assigned_to": agent_name}):
+                        if "_id" in task:
+                            del task["_id"]  # Remove MongoDB ID
+                        tasks.append(task)
+                    
+                    if tasks:
+                        context["tasks"] = tasks
+                except Exception as e:
+                    print(f"Error getting tasks for context: {str(e)}")
+            
+            return context
+            
+        except Exception as e:
+            print(f"Error getting agent context: {str(e)}")
+            return {"error": str(e)}
     
     def _run_async_in_sync_context(self, coro):
-        """Helper method to run async code in a synchronous context."""
-        try:
-            # Simply use asyncio.run which handles event loop creation and cleanup
-            return asyncio.run(coro)
-        except RuntimeError as e:
-            # This happens when there's already a running event loop
-            # We'll get the current event loop and use run_until_complete
-            # if possible, or create a new loop if necessary
+        """
+        Run an async coroutine in a synchronous context safely.
+        Handles the case where an event loop might already be running.
+        """
+        # Check if we're already in an async context
+        if inspect.iscoroutinefunction(inspect.currentframe().f_back.f_code):
+            # If we're called from an async function, just return the coroutine
+            return coro
+            
+        # Check if we have a thread-local event loop already running
+        loop = getattr(_event_loop_tls, 'loop', None)
+        
+        if loop is None or not loop.is_running():
+            # If no loop or loop is not running, create a new one
             try:
-                loop = asyncio.get_event_loop()
-                return loop.run_until_complete(coro)
-            except RuntimeError:
-                # If we can't get the current event loop, create a new one
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    return new_loop.run_until_complete(coro)
-                finally:
-                    # Always close the loop we created to prevent memory leaks
-                    new_loop.close()
-                    # Reset the event loop to None to avoid conflicts
-                    asyncio.set_event_loop(None)
+                _event_loop_tls.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(_event_loop_tls.loop)
+                return _event_loop_tls.loop.run_until_complete(coro)
+            finally:
+                asyncio.set_event_loop(None)
+                _event_loop_tls.loop = None
+        else:
+            # We're in a context where loop is already running, but not in an async function
+            # Use a thread to run the coroutine
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            return future.result()
     
-    def add_message_sync(self, agent_name: str, user_message: str, agent_response: str):
+    def add_message_sync(self, agent_name: str, user_message: str, agent_response: str, project_name: Optional[str] = None):
         """Synchronous wrapper for add_message"""
-        return self._run_async_in_sync_context(self.add_message(agent_name, user_message, agent_response))
+        return self._run_async_in_sync_context(self.add_message(agent_name, user_message, agent_response, project_name))
     
     def get_conversation_history_sync(self, agent_name: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Synchronous wrapper for get_conversation_history"""
@@ -178,16 +253,16 @@ class MongoSharedMemory:
         """Synchronous wrapper for get_context"""
         return self._run_async_in_sync_context(self.get_context(key))
     
-    def get_agent_context_sync(self, agent_name: str) -> Dict[str, Any]:
+    def get_agent_context_sync(self, agent_name: str, project_name: Optional[str] = None) -> Dict[str, Any]:
         """Synchronous wrapper for get_agent_context"""
-        return self._run_async_in_sync_context(self.get_agent_context(agent_name))
+        return self._run_async_in_sync_context(self.get_agent_context(agent_name, project_name))
 
 # Create a singleton instance
 mongo_shared_memory = MongoSharedMemory()
 
 # Compatibility with original SharedMemory
-def add_message(agent_name, user_message, agent_response):
-    return mongo_shared_memory.add_message_sync(agent_name, user_message, agent_response)
+def add_message(agent_name, user_message, agent_response, project_name=None):
+    return mongo_shared_memory.add_message_sync(agent_name, user_message, agent_response, project_name)
 
 def get_conversation_history(agent_name, limit=10):
     return mongo_shared_memory.get_conversation_history_sync(agent_name, limit)
@@ -201,5 +276,5 @@ def add_context(key, value):
 def get_context(key=None):
     return mongo_shared_memory.get_context_sync(key)
 
-def get_agent_context(agent_name):
-    return mongo_shared_memory.get_agent_context_sync(agent_name) 
+def get_agent_context(agent_name, project_name=None):
+    return mongo_shared_memory.get_agent_context_sync(agent_name, project_name) 

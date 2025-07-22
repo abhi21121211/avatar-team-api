@@ -7,6 +7,15 @@ from typing import Dict, List, Any, Optional
 from pydantic import Field
 import asyncio
 import os
+import re
+
+# Import function to get team member names
+try:
+    from utils.database import get_team_member_name
+except ImportError:
+    # Mock function for compatibility if database module doesn't have it
+    async def get_team_member_name(role):
+        return None
 
 class ProductManager(BaseAgent):
     """Product Manager agent acting as Team Lead for various projects."""
@@ -33,6 +42,200 @@ class ProductManager(BaseAgent):
 
     def _generate_response(self, message, context):
         """Generate a response based on the message and context using Gemini API"""
+        # First check for command patterns - we'll bypass the LLM entirely for these
+        msg_lower = message.lower()
+        
+        # Check for "contact team" or "get status" type commands
+        # These are MUST MATCH patterns - we want to ensure the LLM doesn't generate 
+        # email templates for these specific commands
+        team_contact_patterns = [
+            "contact your team", 
+            "contact the team",
+            "get status from team", 
+            "get team status",
+            "get updates from team",
+            "team status update",
+            "check with the team",
+            "talk to your team",
+            "ask the team for status"
+        ]
+        
+        # Direct API call for team contact
+        if any(pattern in msg_lower for pattern in team_contact_patterns):
+            print("DETECTED TEAM CONTACT COMMAND - BYPASSING LLM")
+            try:
+                # For logging to verify this is being called
+                print(f"🚀 Executing direct team contact for command: {message}")
+                
+                # Use API to contact all agents directly
+                team_members = ["frontendEngineer", "backendEngineer", "chiefArchitect", "uiUxDesigner"]
+                status_query = "What's your current status and what are you working on for this project? Please provide a brief update."
+                
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                results = {}
+                for agent in team_members:
+                    if agent in self.agent_registry:
+                        try:
+                            print(f"📞 Directly contacting agent: {agent}")
+                            # IMPORTANT: Using communicate_with_agent directly
+                            response = loop.run_until_complete(
+                                self.communicate_with_agent(agent, status_query)
+                            )
+                            results[agent] = response
+                            print(f"✅ Got response from {agent}")
+                        except Exception as e:
+                            print(f"❌ Error contacting {agent}: {str(e)}")
+                            results[agent] = f"Could not reach {agent}: {str(e)}"
+                
+                # Format the DIRECT results - not using LLM
+                formatted_response = "## Team Status Report\n\nI've contacted the team members directly and received the following updates:\n\n"
+                
+                for agent, response in results.items():
+                    formatted_response += f"### {agent}\n{response}\n\n"
+                
+                formatted_response += "\nI'll follow up with any team members who appear to be facing challenges or haven't made expected progress."
+                
+                print("✅ Successfully executed team contact command")
+                return formatted_response
+                
+            except Exception as e:
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"❌ Error executing team contact: {str(e)}\n{error_details}")
+                return f"⚠️ I tried to contact the team directly but encountered a technical error. Details: {str(e)}"
+        
+        # Team Task Assignment
+        if "have the team" in msg_lower or "assign the team" in msg_lower or "get the team to" in msg_lower:
+            print("DETECTED TEAM TASK ASSIGNMENT - BYPASSING LLM")
+            try:
+                # For logging
+                print(f"🚀 Executing direct team task assignment: {message}")
+                
+                # Extract the task from the command
+                task_parts = message.split("team")
+                if len(task_parts) > 1:
+                    task_description = task_parts[1].strip()
+                else:
+                    task_description = message
+                
+                # Use MCP API to coordinate multiple agents
+                team_members = ["frontendEngineer", "backendEngineer", "chiefArchitect", "uiUxDesigner"]
+                
+                import asyncio
+                
+                async def run_coordination():
+                    print("📊 Starting multi-agent coordination")
+                    results = await self.coordinate_multi_agent_task(task_description, team_members)
+                    print(f"✅ Completed coordination with results: {results.keys()}")
+                    return results
+                
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                results = loop.run_until_complete(run_coordination())
+                
+                # Format the direct results
+                formatted_response = f"## Team Task Assignment: {task_description}\n\nI've assigned this task to the team and received the following responses:\n\n"
+                
+                for agent, response in results.items():
+                    formatted_response += f"### {agent}\n{response}\n\n"
+                
+                formatted_response += "\nI'll track their progress and ensure the task is completed efficiently."
+                
+                print("✅ Successfully executed team task assignment")
+                return formatted_response
+                
+            except Exception as e:
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"❌ Error executing team task assignment: {str(e)}\n{error_details}")
+                return f"⚠️ I tried to assign the task to the team but encountered a technical error. Details: {str(e)}"
+        
+        # For individual tasks to specific team members
+        # Try to detect patterns like "have X do Y" or "ask X to do Y"
+        agent_task_patterns = [
+            r"have (the )?([\w\s]+) (do|create|build|implement|design|work on) ([\w\s]+)",
+            r"ask (the )?([\w\s]+) to (do|create|build|implement|design|work on) ([\w\s]+)",
+            r"assign (the )?([\w\s]+) to (do|create|build|implement|design|work on) ([\w\s]+)"
+        ]
+        
+        import re
+        for pattern in agent_task_patterns:
+            match = re.search(pattern, msg_lower)
+            if match:
+                try:
+                    # Extract agent and task
+                    agent_role = match.group(2).strip()
+                    task_verb = match.group(3).strip()
+                    task_obj = match.group(4).strip()
+                    
+                    # Map common terms to agent role IDs
+                    role_mapping = {
+                        "frontend": "frontendEngineer",
+                        "frontend engineer": "frontendEngineer",
+                        "backend": "backendEngineer", 
+                        "backend engineer": "backendEngineer",
+                        "architect": "chiefArchitect",
+                        "chief architect": "chiefArchitect",
+                        "devops": "devopsEngineer",
+                        "designer": "uiUxDesigner",
+                        "ui designer": "uiUxDesigner",
+                        "ux designer": "uiUxDesigner",
+                        "ui/ux": "uiUxDesigner",
+                        "ai": "aiMlEngineer",
+                        "ml": "aiMlEngineer",
+                        "ai engineer": "aiMlEngineer",
+                        "writer": "technicalWriter",
+                        "technical writer": "technicalWriter",
+                        "customer": "customerSuccess",
+                        "legal": "legalCompliance",
+                        "marketing": "marketingSales"
+                    }
+                    
+                    # Find the right agent
+                    target_agent = None
+                    for key, value in role_mapping.items():
+                        if key in agent_role:
+                            target_agent = value
+                            break
+                    
+                    # If no match found, try direct match
+                    if not target_agent and agent_role in self.agent_registry:
+                        target_agent = agent_role
+                    
+                    if target_agent and target_agent in self.agent_registry:
+                        # Execute the task assignment directly
+                        print(f"🎯 Assigning task directly to {target_agent}: {task_verb} {task_obj}")
+                        
+                        task_description = f"{task_verb} {task_obj}"
+                        
+                        import asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                        
+                        # Call the assign_and_start_task method directly
+                        response = loop.run_until_complete(self.assign_and_start_task(target_agent, task_description))
+                        
+                        return f"## Task Assignment\n\nI've assigned {target_agent} to {task_verb} {task_obj}. Here's their response:\n\n{response}"
+                except Exception as e:
+                    import traceback
+                    error_details = traceback.format_exc()
+                    print(f"❌ Error executing individual task assignment: {str(e)}\n{error_details}")
+                    return f"⚠️ I tried to assign the task but encountered a technical error. Details: {str(e)}"
+        
+        # If none of the direct commands matched, use the normal LLM response
         # Get context from other agents
         other_context = ""
         if context and "all_conversations" in context:
@@ -45,13 +248,13 @@ class ProductManager(BaseAgent):
                 print(f"Error processing conversations: {str(e)}")
                 # Continue without the context
         
-        # Check if this is a command to assign tasks or communicate with agents
-        if "assign task" in message.lower() or "assign to" in message.lower():
-            # Try to parse the message to assign a task
-            return self._handle_task_assignment_request(message, context)
-        elif "talk to" in message.lower() or "discuss with" in message.lower() or "ask" in message.lower():
-            # Try to parse the message to talk to another agent
-            return self._handle_agent_communication_request(message, context)
+        # Detect project-related context automatically
+        project_name = None
+        if context and "current_project" in context:
+            project_name = context["current_project"]
+            # Update project manager's current project
+            if self.project_manager:
+                self.project_manager.current_project = project_name
         
         # Get current project details if available
         project_info = ""
@@ -72,22 +275,33 @@ class ProductManager(BaseAgent):
             except Exception as project_error:
                 print(f"Error getting project info: {str(project_error)}")
         
+        # Get the display name for the prompt
+        display_name = context.get("display_name", "Product Manager")
+        
         # Create a professional prompt for Gemini with Team Lead focus
-        prompt = f"""You are the Product Manager and Team Lead for an Avatar Team responsible for all types of projects.
-        As the team lead, you are responsible for:
-        - Managing the entire project lifecycle and coordinating all team members
-        - Breaking down complex goals into subtasks for the right specialists
-        - Tracking progress, validating work, and ensuring quality delivery 
-        - Making critical decisions about project direction and resource allocation
-        - Maintaining shared context and memory across the team
+        prompt = f"""You are {display_name}, the Product Manager and Team Lead for an Avatar Team responsible for all types of projects.
+        Your name is {display_name}.
         
-        Your expertise includes:
-        - Agile and Kanban project management methodologies
-        - B2B project workflows and stakeholder management
-        - Dependency mapping, timeline management, and risk assessment
-        - Team coordination and cross-functional leadership
+        EXTREMELY IMPORTANT: Do NOT generate template-like emails. Provide concise, direct responses that reflect actions you are taking right now.
         
+        EXTREMELY IMPORTANT: When asked to contact team members or assign tasks, explain that you are doing this directly through the system API, not by sending emails.
+
+        EXTREMELY IMPORTANT: You are the AI agent, but you must behave as if you are a human professional. You have your own team, and you interact directly with clients. Maintain a highly professional demeanor at all times.
+
+        When a client gives you instructions, do not respond with phrases like "we need to schedule a meeting" or "we'll check client availability." Instead, you are expected to independently coordinate with your team (who are also AI agents acting like humans), discuss the task internally, and present a final plan to the client.
+        
+        If the client requests any changes to the plan, coordinate with your team again to revise it. Once the client approves the plan, immediately begin execution with your team. You are also responsible for collecting progress updates from every team member and keeping the client informed accordingly.
+        
+        Remember, your team consists of AI agents as well, but all of you must operate as if you're part of a real, professional human organization. 
+        
+        Current project information:
         {project_info}
+        
+        As the team lead, you are responsible for:
+        - Managing the project lifecycle and coordinating team members
+        - Breaking down goals into subtasks for specialists
+        - Tracking progress and ensuring quality delivery
+        - Making decisions about project direction
         
         Previous context from team members:
         {other_context}
@@ -97,9 +311,7 @@ class ProductManager(BaseAgent):
         
         User message: {message}
         
-        Please provide a professional and decisive response that demonstrates your leadership.
-        Focus on actionable insights, clear decision-making, and effective team coordination.
-        When appropriate, specify which team members should handle specific tasks."""
+        Provide direct, actionable responses. DO NOT create email templates or theoretical plans. Focus on real actions you're taking in the system."""
         
         # Get response from Gemini
         try:
@@ -108,6 +320,296 @@ class ProductManager(BaseAgent):
         except Exception as e:
             print(f"Error generating response from Gemini: {str(e)}")
             return f"I'm having trouble generating a response right now. Let me try again later. Error: {str(e)}"
+    
+    def _handle_project_creation(self, message, project_name=None):
+        """Handle project creation request"""
+        if not project_name:
+            # Extract project name from message
+            project_name_match = re.search(r'project\s+(?:called|named)?\s*["\']?([A-Za-z0-9_-]+)["\']?', message)
+            if project_name_match:
+                project_name = project_name_match.group(1)
+            else:
+                project_name = "NewProject"
+        
+        # Extract project description from message
+        description_match = re.search(r'for\s+(.*?)(?:\.|$)', message)
+        description = description_match.group(1) if description_match else "New project"
+        
+        try:
+            # Actually create the project
+            if self.project_manager:
+                project = self.project_manager.create_project(project_name, description)
+                self.project_manager.current_project = project_name
+                
+                return f"I've created the project '{project_name}' with the description: '{description}'. The project has been initialized and is ready for planning. What specific aspects would you like me to focus on first?"
+            else:
+                return "I'm unable to create a project right now because the project manager is not available. Please check the system configuration."
+        except Exception as e:
+            return f"I tried to create the project but encountered an error: {str(e)}. Please check if the project already exists or if there's a system issue."
+    
+    def _handle_project_planning(self, message, project_name=None):
+        """Handle project planning request"""
+        if not self.project_manager or not self.project_manager.current_project and not project_name:
+            return "I need an active project to create a plan. Please create or select a project first."
+        
+        project_name = project_name or self.project_manager.current_project
+        
+        try:
+            # Create actual tasks for the project
+            tasks = [
+                {
+                    "name": "Design system architecture",
+                    "description": "Create a detailed system design document",
+                    "assigned_to": "chiefArchitect",
+                    "status": "pending",
+                    "priority": "high"
+                },
+                {
+                    "name": "Set up project repository",
+                    "description": "Initialize git repository and project structure",
+                    "assigned_to": "backendEngineer",
+                    "status": "pending",
+                    "priority": "high"
+                },
+                {
+                    "name": "Create UI mockups",
+                    "description": "Design user interface mockups for key screens",
+                    "assigned_to": "uiUxDesigner",
+                    "status": "pending",
+                    "priority": "medium"
+                },
+                {
+                    "name": "Set up CI/CD pipeline",
+                    "description": "Configure continuous integration and deployment",
+                    "assigned_to": "devopsEngineer",
+                    "status": "pending",
+                    "priority": "medium"
+                }
+            ]
+            
+            # Add tasks to the project
+            for task in tasks:
+                self.project_manager.add_task(project_name, task)
+            
+            # Extract key requirements from the message
+            requirements = []
+            if "social media" in message:
+                requirements.append("social media platform")
+            if "user profiles" in message:
+                requirements.append("user profiles")
+            if "posting" in message:
+                requirements.append("posting capabilities")
+            if "notification" in message:
+                requirements.append("notification system")
+            
+            requirements_str = ", ".join(requirements) if requirements else "the application"
+            
+            return f"I've created a project plan for {project_name} with initial tasks assigned to the team. I've added tasks for the Chief Architect to design the system, Backend Engineer to set up the repository, UI/UX Designer to create mockups, and DevOps Engineer to set up CI/CD. These tasks focus on {requirements_str}. Would you like me to assign any additional specific tasks?"
+        except Exception as e:
+            return f"I tried to create a project plan but encountered an error: {str(e)}. Please check if the project exists and if the team members are available."
+    
+    def _handle_project_finalization(self, message, project_name=None):
+        """Handle project finalization request"""
+        if not self.project_manager or not self.project_manager.current_project and not project_name:
+            return "I need an active project to finalize. Please create or select a project first."
+        
+        project_name = project_name or self.project_manager.current_project
+        
+        try:
+            # Update task statuses to ready
+            tasks = self.project_manager.get_tasks(project_name)
+            for task in tasks:
+                if task["status"] == "pending":
+                    self.project_manager.update_task_status(project_name, task["id"], "ready")
+            
+            # Add a kickoff task
+            kickoff_task = {
+                "name": "Project Kickoff",
+                "description": "Initial team meeting to align on project goals and tasks",
+                "assigned_to": "productManager",
+                "status": "in_progress",
+                "priority": "high"
+            }
+            self.project_manager.add_task(project_name, kickoff_task)
+            
+            return f"I've finalized the project plan for {project_name}. All tasks are now marked as 'ready' and team members can begin work. I've scheduled a project kickoff to align the team on our goals. Each team member can view their assigned tasks. Is there anything specific you'd like me to focus on during the kickoff?"
+        except Exception as e:
+            return f"I tried to finalize the project plan but encountered an error: {str(e)}. Please check if the project exists and if there are any tasks created."
+    
+    def _handle_project_kickoff(self, message, project_name=None):
+        """Handle project kickoff request"""
+        if not self.project_manager or not self.project_manager.current_project and not project_name:
+            return "I need an active project to kick off. Please create or select a project first."
+        
+        project_name = project_name or self.project_manager.current_project
+        
+        try:
+            # Notify each team member about their tasks
+            tasks_by_agent = {}
+            all_tasks = self.project_manager.get_tasks(project_name)
+            
+            for task in all_tasks:
+                agent_role = task.get("assigned_to")
+                if agent_role and agent_role in self.agent_registry:
+                    if agent_role not in tasks_by_agent:
+                        tasks_by_agent[agent_role] = []
+                    tasks_by_agent[agent_role].append(task)
+            
+            # Create notification messages
+            for agent_role, tasks in tasks_by_agent.items():
+                task_list = "\n".join([f"- {task['name']}: {task['description']} (Priority: {task.get('priority', 'medium')})" for task in tasks])
+                notification = f"Project {project_name} has kicked off. You have been assigned the following tasks:\n\n{task_list}\n\nPlease begin work on these tasks in order of priority."
+                
+                # Store notification in project context
+                if "kickoff_notifications" not in self.project_context:
+                    self.project_context["kickoff_notifications"] = {}
+                self.project_context["kickoff_notifications"][agent_role] = notification
+            
+            return f"I've kicked off the project {project_name}. All team members have been notified of their tasks and can begin work immediately. The Chief Architect will start with the system design, while the UI/UX Designer begins creating mockups. The Backend Engineer will set up the project repository, and the DevOps Engineer will prepare the CI/CD pipeline. I'll track progress and provide regular updates."
+        except Exception as e:
+            return f"I tried to kick off the project but encountered an error: {str(e)}. Please check if the project exists and if team members have been assigned tasks."
+    
+    def _handle_project_status(self, message, project_name=None):
+        """Handle project status request"""
+        if not self.project_manager or not self.project_manager.current_project and not project_name:
+            return "I don't have an active project to provide status on. Please create or select a project first."
+        
+        project_name = project_name or self.project_manager.current_project
+        
+        try:
+            # Get actual project tasks and their status
+            tasks = self.project_manager.get_tasks(project_name)
+            
+            if not tasks:
+                return f"Project {project_name} exists but doesn't have any tasks yet. Would you like me to create an initial project plan with tasks?"
+            
+            # Count tasks by status
+            status_counts = {}
+            for task in tasks:
+                status = task.get("status", "pending")
+                if status not in status_counts:
+                    status_counts[status] = 0
+                status_counts[status] += 1
+            
+            # Calculate completion percentage
+            total_tasks = len(tasks)
+            completed_tasks = status_counts.get("completed", 0)
+            completion_percentage = int((completed_tasks / total_tasks * 100) if total_tasks > 0 else 0)
+            
+            # Compile status by team member
+            team_status = {}
+            for task in tasks:
+                assignee = task.get("assigned_to")
+                if assignee:
+                    if assignee not in team_status:
+                        team_status[assignee] = {"total": 0, "completed": 0, "in_progress": 0, "pending": 0}
+                    team_status[assignee]["total"] += 1
+                    status = task.get("status", "pending")
+                    if status in team_status[assignee]:
+                        team_status[assignee][status] += 1
+            
+            # Format the response
+            status_response = f"Current status of {project_name} (Overall completion: {completion_percentage}%):\n\n"
+            
+            # Add status breakdown
+            status_response += "Task Status:\n"
+            for status, count in status_counts.items():
+                status_response += f"- {status.upper()}: {count} tasks\n"
+            
+            # Add team member breakdown
+            status_response += "\nTeam Member Status:\n"
+            for member, stats in team_status.items():
+                try:
+                    # Try to get display name
+                    member_name = self.agent_registry[member].get_display_name() if member in self.agent_registry else member
+                except:
+                    member_name = member
+                    
+                member_completion = int((stats["completed"] / stats["total"] * 100) if stats["total"] > 0 else 0)
+                status_response += f"- {member_name}: {stats['completed']}/{stats['total']} tasks completed ({member_completion}%)\n"
+            
+            # Add next steps
+            status_response += "\nNext Steps:\n"
+            in_progress_tasks = [task for task in tasks if task.get("status") == "in_progress"]
+            if in_progress_tasks:
+                for task in in_progress_tasks[:3]:  # Show up to 3 in-progress tasks
+                    assignee = task.get("assigned_to", "Unassigned")
+                    status_response += f"- Continue work on '{task['name']}' (Assigned to: {assignee})\n"
+            
+            pending_tasks = [task for task in tasks if task.get("status") == "pending"]
+            if pending_tasks:
+                for task in pending_tasks[:3]:  # Show up to 3 pending tasks
+                    assignee = task.get("assigned_to", "Unassigned")
+                    status_response += f"- Start work on '{task['name']}' (Assigned to: {assignee})\n"
+            
+            return status_response
+        except Exception as e:
+            return f"I tried to get the project status but encountered an error: {str(e)}. Please check if the project exists and if there are any tasks created."
+    
+    def _handle_project_priorities(self, message, project_name=None):
+        """Handle project priorities request"""
+        if not self.project_manager or not self.project_manager.current_project and not project_name:
+            return "I don't have an active project to provide priorities for. Please create or select a project first."
+        
+        project_name = project_name or self.project_manager.current_project
+        
+        try:
+            # Get actual project tasks
+            tasks = self.project_manager.get_tasks(project_name)
+            
+            if not tasks:
+                return f"Project {project_name} exists but doesn't have any tasks yet. Would you like me to create an initial project plan with prioritized tasks?"
+            
+            # Filter tasks that aren't completed
+            active_tasks = [task for task in tasks if task.get("status") != "completed"]
+            
+            # Sort by priority
+            priority_order = {"high": 0, "medium": 1, "low": 2}
+            active_tasks.sort(key=lambda x: priority_order.get(x.get("priority", "medium"), 1))
+            
+            # Format the response
+            if not active_tasks:
+                return f"All tasks in project {project_name} have been completed! Would you like me to create new tasks for the next phase?"
+            
+            # Group by priority
+            priorities_response = f"Current priorities for {project_name}:\n\n"
+            
+            priorities_response += "HIGH PRIORITY:\n"
+            high_priority = [task for task in active_tasks if task.get("priority") == "high"]
+            if high_priority:
+                for task in high_priority:
+                    assignee = task.get("assigned_to", "Unassigned")
+                    status = task.get("status", "pending").upper()
+                    priorities_response += f"- {task['name']} (Assigned to: {assignee}, Status: {status})\n"
+            else:
+                priorities_response += "- No high priority tasks currently\n"
+            
+            priorities_response += "\nMEDIUM PRIORITY:\n"
+            medium_priority = [task for task in active_tasks if task.get("priority") == "medium"]
+            if medium_priority:
+                for task in medium_priority[:3]:  # Show up to 3 medium priority tasks
+                    assignee = task.get("assigned_to", "Unassigned")
+                    status = task.get("status", "pending").upper()
+                    priorities_response += f"- {task['name']} (Assigned to: {assignee}, Status: {status})\n"
+                if len(medium_priority) > 3:
+                    priorities_response += f"- Plus {len(medium_priority) - 3} more medium priority tasks\n"
+            else:
+                priorities_response += "- No medium priority tasks currently\n"
+            
+            priorities_response += "\nRecommended next actions:\n"
+            pending_high = [task for task in high_priority if task.get("status") == "pending"]
+            if pending_high:
+                task = pending_high[0]
+                assignee = task.get("assigned_to", "someone")
+                priorities_response += f"1. {assignee} should start work on '{task['name']}'\n"
+            
+            blocked_tasks = [task for task in active_tasks if task.get("status") == "blocked"]
+            if blocked_tasks:
+                priorities_response += f"2. Address blockers for {len(blocked_tasks)} blocked tasks\n"
+            
+            return priorities_response
+        except Exception as e:
+            return f"I tried to determine project priorities but encountered an error: {str(e)}. Please check if the project exists and if there are any tasks created."
     
     def _handle_task_assignment_request(self, message, context):
         """Handle a request to assign tasks to team members"""
@@ -253,24 +755,29 @@ class ProductManager(BaseAgent):
                 "frontend engineer": "frontendEngineer", 
                 "backend": "backendEngineer",
                 "backend engineer": "backendEngineer",
-                "architect": "chiefArchitect",
                 "chief architect": "chiefArchitect",
+                "architect": "chiefArchitect",
                 "devops": "devopsEngineer",
                 "devops engineer": "devopsEngineer",
+                "ui": "uiUxDesigner",
+                "ux": "uiUxDesigner",
+                "designer": "uiUxDesigner",
+                "ui ux": "uiUxDesigner",
+                "ui ux designer": "uiUxDesigner",
                 "ai": "aiMlEngineer",
                 "ml": "aiMlEngineer",
-                "ai/ml": "aiMlEngineer",
-                "ui": "uiUxDesigner",
-                "ui/ux": "uiUxDesigner",
-                "designer": "uiUxDesigner",
+                "ai ml": "aiMlEngineer",
+                "ai ml engineer": "aiMlEngineer",
                 "writer": "technicalWriter",
                 "technical writer": "technicalWriter",
-                "customer": "customerSuccess",
+                "support": "customerSuccess",
                 "customer success": "customerSuccess",
                 "legal": "legalCompliance",
                 "compliance": "legalCompliance",
+                "legal compliance": "legalCompliance",
                 "marketing": "marketingSales",
-                "sales": "marketingSales"
+                "sales": "marketingSales",
+                "marketing sales": "marketingSales"
             }
             
             # Try to match role with standard names
@@ -302,115 +809,148 @@ class ProductManager(BaseAgent):
     
     async def communicate_with_agent(self, agent_role: str, message: str) -> str:
         """A2A protocol: Send a message directly to another agent and get response"""
-        if agent_role not in self.agent_registry:
-            return f"Agent {agent_role} not found in the team."
-        
         try:
+            # Validate that the agent exists
+            if agent_role not in self.agent_registry:
+                valid_agents = list(self.agent_registry.keys())
+                return f"Error: Agent '{agent_role}' not found. Valid agents are: {', '.join(valid_agents)}"
+            
+            # Get the agent object
             target_agent = self.agent_registry[agent_role]
-            # Add context that this is an A2A communication
-            a2a_message = f"[A2A REQUEST from ProductManager] {message}"
             
-            # Get response from the agent
-            response = await target_agent.chat(a2a_message)
+            # Format a simpler message that will work with any agent
+            formatted_message = f"Message from Product Manager: {message}"
             
-            # Store this communication in the project context
-            if "a2a_communications" not in self.project_context:
-                self.project_context["a2a_communications"] = []
+            # Get the current project if available
+            current_project = None
+            if self.project_manager:
+                current_project = self.project_manager.current_project
             
-            self.project_context["a2a_communications"].append({
+            # Call the agent's chat method if available, fallback to execute
+            if hasattr(target_agent, "chat") and callable(target_agent.chat):
+                response = await target_agent.chat(formatted_message)
+            elif hasattr(target_agent, "execute") and callable(target_agent.execute):
+                response = await target_agent.execute(formatted_message)
+            else:
+                return f"Error: Agent '{agent_role}' does not support communication."
+            
+            # Record this communication when possible
+            try:
+                from memory.mongo_memory import add_message
+                add_message(
+                    f"pm_to_{agent_role}", 
+                    formatted_message, 
+                    response,
+                    current_project
+                )
+            except Exception as e:
+                print(f"Error recording communication: {str(e)}")
+            
+            # Add to project context
+            self.project_context.setdefault("communications", []).append({
                 "timestamp": self._get_timestamp(),
-                "from": self.role,
+                "from": "productManager",
                 "to": agent_role,
                 "message": message,
                 "response": response
             })
             
             return response
-        except Exception as e:
-            error_message = f"Error communicating with {agent_role}: {str(e)}"
-            print(error_message)
-            
-            # Store the failed communication attempt
-            if "a2a_communications" not in self.project_context:
-                self.project_context["a2a_communications"] = []
                 
-            self.project_context["a2a_communications"].append({
-                "timestamp": self._get_timestamp(),
-                "from": self.role,
-                "to": agent_role,
-                "message": message,
-                "status": "failed",
-                "error": str(e)
-            })
-            
-            return error_message
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error in agent-to-agent communication: {str(e)}\n{error_details}")
+            return f"Error communicating with {agent_role}: {str(e)}"
     
     async def assign_and_start_task(self, agent_role: str, task: str) -> str:
-        """Assign a task to an agent and instruct them to start working on it"""
-        if agent_role not in self.agent_registry:
-            return f"Agent {agent_role} not found in the team."
-        
+        """Assign a task to a specific agent and get their immediate response"""
         try:
+            # Validate that the agent exists
+            if agent_role not in self.agent_registry:
+                valid_agents = list(self.agent_registry.keys())
+                return f"Error: Agent '{agent_role}' not found. Valid agents are: {', '.join(valid_agents)}"
+            
+            # Get the agent object
             target_agent = self.agent_registry[agent_role]
             
-            # Create the task in the project manager
-            if self.project_manager and self.project_manager.current_project:
-                project_name = self.project_manager.current_project
-                task_obj = {
-                    "name": f"Task for {agent_role}",
-                    "description": task,
-                    "assigned_to": agent_role,
-                    "status": "in_progress",
-                    "priority": "high"
-                }
-                
-                # Add the task
-                self.project_manager.add_task(project_name, task_obj)
-                
-                # Send instructions to start working
-                start_message = f"[TASK ASSIGNMENT] You have been assigned the following task: {task}. Please begin working on this immediately and report when you've made progress."
-                
-                # Send the message to the agent and get their response
-                response = await target_agent.chat(start_message)
-                
-                # Store this assignment in the project context
-                if "task_assignments" not in self.project_context:
-                    self.project_context["task_assignments"] = []
-                
-                self.project_context["task_assignments"].append({
-                    "timestamp": self._get_timestamp(),
-                    "role": agent_role,
-                    "task": task,
-                    "status": "in_progress",
-                    "agent_response": response
-                })
-                
-                return f"Task assigned to {agent_role}. Their response: {response}"
-            else:
-                return "There is no active project. Please create or select a project first before assigning tasks."
-        except Exception as e:
-            error_message = f"Error assigning task to {agent_role}: {str(e)}"
-            print(error_message)
+            # Format a simple task message that will work with any agent
+            task_message = f"Task Assignment from Product Manager: {task}"
             
-            # Log the error in project context
+            # Get the current project if available
+            current_project = None
+            if self.project_manager:
+                current_project = self.project_manager.current_project
+            
+            # Create a task object
+            task_obj = {
+                "name": task[:50] + "..." if len(task) > 50 else task,
+                "description": task,
+                "assigned_to": agent_role,
+                "assigned_by": "productManager",
+                "status": "in_progress",
+                "created_at": self._get_timestamp()
+            }
+            
+            # Store the task in the database if we have a current project
+            if current_project and self.project_manager:
+                try:
+                    self.project_manager.add_task(current_project, task_obj)
+                except Exception as e:
+                    print(f"Error adding task to project: {str(e)}")
+            
+            # Call the agent's chat method if available, fallback to execute
+            if hasattr(target_agent, "chat") and callable(target_agent.chat):
+                response = await target_agent.chat(task_message)
+            elif hasattr(target_agent, "execute") and callable(target_agent.execute):
+                response = await target_agent.execute(task_message)
+            else:
+                return f"Error: Agent '{agent_role}' does not support task assignment."
+            
+            # Record this task assignment when possible
+            try:
+                from memory.mongo_memory import add_message
+                add_message(
+                    f"pm_task_to_{agent_role}", 
+                    task_message, 
+                    response,
+                    current_project
+                )
+            except Exception as e:
+                print(f"Error recording task assignment: {str(e)}")
+            
+            # Update the project context
             if "task_assignments" not in self.project_context:
                 self.project_context["task_assignments"] = []
-                
+            
             self.project_context["task_assignments"].append({
                 "timestamp": self._get_timestamp(),
-                "role": agent_role,
-                "task": task, 
-                "status": "failed",
-                "error": str(e)
+                "task": task,
+                "agent_role": agent_role,
+                "response": response,
+                "project": current_project
             })
             
-            return error_message
+            return response
+        
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Error in task assignment: {str(e)}\n{error_details}")
+            return f"Error assigning task to {agent_role}: {str(e)}"
     
     async def coordinate_multi_agent_task(self, task: str, agents: List[str]) -> Dict[str, str]:
         """MCP coordination: Orchestrate a task requiring multiple agents"""
         if not self.agent_registry or not all(agent in self.agent_registry for agent in agents):
             return {"error": "Not all specified agents are available"}
         
+        # Get product manager's custom name if available
+        try:
+            pm_name_info = await get_team_member_name(self.role)
+            pm_name = pm_name_info["name"] if pm_name_info else "Product Manager"
+        except Exception:
+            pm_name = "Product Manager"
+            
         # Store task in project context
         if "mcp_tasks" not in self.project_context:
             self.project_context["mcp_tasks"] = []
@@ -420,22 +960,43 @@ class ProductManager(BaseAgent):
         # Create task in project manager
         if self.project_manager and self.project_manager.current_project:
             for agent_role in agents:
+                # Get agent's custom name if available
+                try:
+                    agent_name_info = await get_team_member_name(agent_role)
+                    agent_name = agent_name_info["name"] if agent_name_info else agent_role
+                except Exception:
+                    agent_name = agent_role
+                    
                 self.project_manager.add_task(
                     self.project_manager.current_project,
                     {
-                        "name": f"{task_id}_{agent_role}",
+                        "name": f"{task_id}_{agent_name}",
                         "description": task,
                         "assigned_to": agent_role,
+                        "assigned_to_name": agent_name,
+                        "assigned_by": self.role,
+                        "assigned_by_name": pm_name,
                         "status": "pending"
                     }
                 )
         
         # Execute task with each agent
         results = {}
+        agent_names = {}
         for agent_role in agents:
             agent = self.agent_registry[agent_role]
+            
+            # Get agent's custom name if available
+            try:
+                agent_name_info = await get_team_member_name(agent_role)
+                agent_name = agent_name_info["name"] if agent_name_info else agent_role
+                agent_names[agent_role] = agent_name
+            except Exception:
+                agent_name = agent_role
+                agent_names[agent_role] = agent_role
+                
             # Format task for the specific agent
-            agent_task = f"[MCP TASK {task_id}] As part of a coordinated multi-agent task: {task}"
+            agent_task = f"[MCP TASK {task_id} from {pm_name}] As part of a coordinated multi-agent task: {task}"
             response = await agent.execute(agent_task)
             results[agent_role] = response
         
@@ -444,8 +1005,10 @@ class ProductManager(BaseAgent):
             "task_id": task_id,
             "description": task,
             "assigned_agents": agents,
+            "agent_names": agent_names,
             "results": results,
             "status": "completed",
+            "coordinator": pm_name,
             "timestamp": self._get_timestamp()
         })
         
